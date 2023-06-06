@@ -1,10 +1,9 @@
+import os
 import threading
 import socket
 import time
 import datetime
 import struct
-
-from tellopy._internal.protocol import LOG_MSG
 
 from . import logger
 from . import event
@@ -24,6 +23,11 @@ class Tello(object):
     EVENT_LIGHT = event.Event('light')
     EVENT_FLIGHT_DATA = event.Event('fligt_data')
     EVENT_LOG = event.Event('log')
+    EVENT_LOG_HEADER = event.Event('log_header')
+    EVENT_LOG = EVENT_LOG_HEADER
+    EVENT_LOG_RAWDATA = event.Event('log_rawdata')
+    EVENT_LOG_DATA = event.Event('log_data')
+    EVENT_LOG_CONFIG = event.Event('log_config')
     EVENT_TIME = event.Event('time')
     EVENT_VIDEO_FRAME = event.Event('video frame')
     EVENT_VIDEO_DATA = event.Event('video data')
@@ -80,6 +84,12 @@ class Tello(object):
         self.video_encoder_rate = 4
         self.video_stream = None
         self.wifi_strength = 0
+        self.log_data = LogData(log)
+        self.log_data_file = None
+        self.log_data_header_recorded = False
+
+        # fast mode state
+        self.fast_mode = False
 
         # video zoom state
         self.zoom = False
@@ -172,6 +182,14 @@ class Tello(object):
         pkt.fixup()
         return self.send_packet(pkt)
 
+    def throw_and_go(self):
+        """Throw_and_go starts a throw and go sequence"""
+        log.info('throw_and_go (cmd=0x%02x seq=0x%04x)' % (THROW_AND_GO_CMD, self.pkt_seq_num))
+        pkt = Packet(THROW_AND_GO_CMD, 0x48)
+        pkt.add_byte(0x00)
+        pkt.fixup()
+        return self.send_packet(pkt)
+
     def land(self):
         """Land tells the drone to come in for landing."""
         log.info('land (cmd=0x%02x seq=0x%04x)' % (LAND_CMD, self.pkt_seq_num))
@@ -193,6 +211,62 @@ class Tello(object):
         """Quit stops the internal threads."""
         log.info('quit')
         self.__publish(event=self.__EVENT_QUIT_REQ)
+
+    def get_alt_limit(self):
+        ''' ... '''
+        self.log.debug('get altitude limit (cmd=0x%02x seq=0x%04x)' % (
+            ALT_LIMIT_MSG, self.pkt_seq_num))
+        pkt = Packet(ALT_LIMIT_MSG)
+        pkt.fixup()
+        return self.send_packet(pkt)
+
+    def set_alt_limit(self, limit):
+        self.log.info('set altitude limit=%s (cmd=0x%02x seq=0x%04x)' % (
+            int(limit), SET_ALT_LIMIT_CMD, self.pkt_seq_num))
+        pkt = Packet(SET_ALT_LIMIT_CMD)
+        pkt.add_byte(int(limit))
+        pkt.add_byte(0x00)
+        pkt.fixup()
+        self.send_packet(pkt)
+        self.get_alt_limit()
+
+    def get_att_limit(self):
+        ''' ... '''
+        self.log.debug('get attitude limit (cmd=0x%02x seq=0x%04x)' % (
+            ATT_LIMIT_MSG, self.pkt_seq_num))
+        pkt = Packet(ATT_LIMIT_MSG)
+        pkt.fixup()
+        return self.send_packet(pkt)
+
+    def set_att_limit(self, limit):
+        self.log.info('set attitude limit=%s (cmd=0x%02x seq=0x%04x)' % (
+            int(limit), ATT_LIMIT_CMD, self.pkt_seq_num))
+        pkt = Packet(ATT_LIMIT_CMD)
+        pkt.add_byte(0x00)
+        pkt.add_byte(0x00)
+        pkt.add_byte( int(float_to_hex(float(limit))[4:6], 16) ) # 'attitude limit' formatted in float of 4 bytes
+        pkt.add_byte(0x41)
+        pkt.fixup()
+        self.send_packet(pkt)
+        self.get_att_limit()
+
+    def get_low_bat_threshold(self):
+        ''' ... '''
+        self.log.debug('get low battery threshold (cmd=0x%02x seq=0x%04x)' % (
+            LOW_BAT_THRESHOLD_MSG, self.pkt_seq_num))
+        pkt = Packet(LOW_BAT_THRESHOLD_MSG)
+        pkt.fixup()
+        return self.send_packet(pkt)
+
+    def set_low_bat_threshold(self, threshold):
+        self.log.info('set low battery threshold=%s (cmd=0x%02x seq=0x%04x)' % (
+            int(threshold), LOW_BAT_THRESHOLD_CMD, self.pkt_seq_num))
+        pkt = Packet(LOW_BAT_THRESHOLD_CMD)
+        pkt.add_byte(int(threshold))
+        pkt.fixup()
+        self.send_packet(pkt)
+        self.get_low_bat_threshold()
+
 
     def __send_time_command(self):
         log.info('send_time (cmd=0x%02x seq=0x%04x)' %
@@ -377,7 +451,7 @@ class Tello(object):
         log.info('flip_backright (cmd=0x%02x seq=0x%04x)' %
                  (FLIP_CMD, self.pkt_seq_num))
         pkt = Packet(FLIP_CMD, 0x70)
-        pkt.add_byte(FlipBackLeft)
+        pkt.add_byte(FlipBackRight)
         pkt.fixup()
         return self.send_packet(pkt)
 
@@ -424,6 +498,21 @@ class Tello(object):
             log.info('set_roll(val=%4.2f)' % roll)
         self.right_x = self.__fix_range(roll)
 
+    def toggle_fast_mode(self):
+        if self.fast_mode:
+            self.fast_mode = False
+        elif not self.fast_mode:
+            self.fast_mode = True
+
+    def manual_takeoff(self):
+        # Hold max 'yaw' and min 'pitch', 'roll', 'throttle' for several seconds
+        self.set_pitch(-1)
+        self.set_roll(-1)
+        self.set_yaw(1)
+        self.set_throttle(-1)
+        self.fast_mode = False
+
+
     def __send_stick_command(self):
         pkt = Packet(STICK_CMD, 0x60)
 
@@ -431,8 +520,10 @@ class Tello(object):
         axis2 = int(1024 + 660.0 * self.right_y) & 0x7ff
         axis3 = int(1024 + 660.0 * self.left_y) & 0x7ff
         axis4 = int(1024 + 660.0 * self.left_x) & 0x7ff
+        axis5 = int(self.fast_mode) & 0x01
         '''
         11 bits (-1024 ~ +1023) x 4 axis = 44 bits
+        fast_mode takes 1 bit
         44 bits will be packed in to 6 bytes (48 bits)
 
                     axis4      axis3      axis2      axis1
@@ -442,19 +533,31 @@ class Tello(object):
          |       |       |       |       |       |       |
              byte5   byte4   byte3   byte2   byte1   byte0
         '''
-        log.debug("stick command: yaw=%4d thr=%4d pit=%4d rol=%4d" %
-                  (axis4, axis3, axis2, axis1))
-        log.debug("stick command: yaw=%04x thr=%04x pit=%04x rol=%04x" %
-                  (axis4, axis3, axis2, axis1))
-        pkt.add_byte(((axis2 << 11 | axis1) >> 0) & 0xff)
-        pkt.add_byte(((axis2 << 11 | axis1) >> 8) & 0xff)
-        pkt.add_byte(((axis3 << 11 | axis2) >> 5) & 0xff)
-        pkt.add_byte(((axis4 << 11 | axis3) >> 2) & 0xff)
-        pkt.add_byte(((axis4 << 11 | axis3) >> 10) & 0xff)
-        pkt.add_byte(((axis4 << 11 | axis3) >> 18) & 0xff)
+        log.debug("stick command: fast=%d yaw=%4d thr=%4d pit=%4d rol=%4d" %
+                  (axis5, axis4, axis3, axis2, axis1))
+        log.debug("stick command: fast=%04x yaw=%04x thr=%04x pit=%04x rol=%04x" %
+                  (axis5, axis4, axis3, axis2, axis1))
+        packed = axis1 | (axis2 << 11) | (
+            axis3 << 22) | (axis4 << 33) | (axis5 << 44)
+        packed_bytes = struct.pack('<Q', packed)
+        pkt.add_byte(byte(packed_bytes[0]))
+        pkt.add_byte(byte(packed_bytes[1]))
+        pkt.add_byte(byte(packed_bytes[2]))
+        pkt.add_byte(byte(packed_bytes[3]))
+        pkt.add_byte(byte(packed_bytes[4]))
+        pkt.add_byte(byte(packed_bytes[5]))
         pkt.add_time()
         pkt.fixup()
         log.debug("stick command: %s" % byte_to_hexstring(pkt.get_buffer()))
+        return self.send_packet(pkt)
+
+    def __send_ack_log(self, id):
+        pkt = Packet(LOG_HEADER_MSG, 0x50)
+        pkt.add_byte(0x00)
+        b0, b1 = le16(id)
+        pkt.add_byte(b0)
+        pkt.add_byte(b1)
+        pkt.fixup()
         return self.send_packet(pkt)
 
     def send_packet(self, pkt):
@@ -506,15 +609,41 @@ class Tello(object):
         pkt = Packet(data)
         cmd = uint16(data[5], data[6])
 
-        if cmd == LOG_MSG:
-            log.debug("recv: log: %s" % byte_to_hexstring(data[9:]))
-            self.__publish(event=self.EVENT_LOG, data=data[9:])
+        if cmd == LOG_HEADER_MSG:
+            id = uint16(data[9], data[10])
+            log.info("recv: log_header: id=%04x, '%s'" % (id, str(data[28:54])))
+            log.debug("recv: log_header: %s" % byte_to_hexstring(data[9:]))
+            self.__send_ack_log(id)
+            self.__publish(event=self.EVENT_LOG_HEADER, data=data[9:])
+            if self.log_data_file and not self.log_data_header_recorded:
+                self.log_data_file.write(data[12:-2])
+                self.log_data_header_recorded = True
+        elif cmd == LOG_DATA_MSG:
+            log.debug("recv: log_data: length=%d, %s" % (len(data[9:]), byte_to_hexstring(data[9:])))
+            self.__publish(event=self.EVENT_LOG_RAWDATA, data=data[9:])
+            try:
+                self.log_data.update(data[10:])
+                if self.log_data_file:
+                    self.log_data_file.write(data[10:-2])
+            except Exception as ex:
+                log.error('%s' % str(ex))
+            self.__publish(event=self.EVENT_LOG_DATA, data=self.log_data)
+
+        elif cmd == LOG_CONFIG_MSG:
+            log.debug("recv: log_config: length=%d, %s" % (len(data[9:]), byte_to_hexstring(data[9:])))
+            self.__publish(event=self.EVENT_LOG_CONFIG, data=data[9:])
         elif cmd == WIFI_MSG:
             log.debug("recv: wifi: %s" % byte_to_hexstring(data[9:]))
             self.wifi_strength = data[9]
             self.__publish(event=self.EVENT_WIFI, data=data[9:])
+        elif cmd == ALT_LIMIT_MSG:
+            log.info("recv: altitude limit: %s" % byte_to_hexstring(data[9:-2]))
+        elif cmd == ATT_LIMIT_MSG:
+            log.info("recv: attitude limit: %s" % byte_to_hexstring(data[9:-2]))
+        elif cmd == LOW_BAT_THRESHOLD_MSG:
+            log.info("recv: low battery threshold: %s" % byte_to_hexstring(data[9:-2]))
         elif cmd == LIGHT_MSG:
-            log.debug("recv: light: %s" % byte_to_hexstring(data[9:]))
+            log.debug("recv: light: %s" % byte_to_hexstring(data[9:-2]))
             self.__publish(event=self.EVENT_LIGHT, data=data[9:])
         elif cmd == FLIGHT_MSG:
             flight_data = FlightData(data[9:])
@@ -524,9 +653,9 @@ class Tello(object):
         elif cmd == TIME_CMD:
             log.debug("recv: time data: %s" % byte_to_hexstring(data))
             self.__publish(event=self.EVENT_TIME, data=data[7:9])
-        elif cmd in (TAKEOFF_CMD, LAND_CMD, VIDEO_START_CMD, VIDEO_ENCODER_RATE_CMD, PALM_LAND_CMD,
-                     EXPOSURE_CMD):
-            log.info("recv: ack: cmd=0x%02x seq=0x%04x %s" %
+        elif cmd in (SET_ALT_LIMIT_CMD, ATT_LIMIT_CMD, LOW_BAT_THRESHOLD_CMD, TAKEOFF_CMD, LAND_CMD, VIDEO_START_CMD, VIDEO_ENCODER_RATE_CMD, PALM_LAND_CMD,
+                     EXPOSURE_CMD, THROW_AND_GO_CMD, EMERGENCY_CMD):
+            log.debug("recv: ack: cmd=0x%02x seq=0x%04x %s" %
                      (uint16(data[5], data[6]), uint16(data[7], data[8]), byte_to_hexstring(data)))
         elif cmd == TELLO_CMD_FILE_SIZE:
             # Drone is about to send us a file. Get ready.
@@ -543,8 +672,7 @@ class Tello(object):
             else:
                 # We always seem to get two files, one with most of the payload missing.
                 # Not sure what the second one is for.
-                log.warn('      file size: payload too small: %s' %
-                         byte_to_hexstring(pkt.get_data()))
+                log.warn('      file size: payload too small: %s' % byte_to_hexstring(pkt.get_data()))
             # Ack the packet.
             self.send_packet(pkt)
         elif cmd == TELLO_CMD_FILE_DATA:
@@ -553,8 +681,7 @@ class Tello(object):
             # for earlier.
             self.recv_file_data(pkt.get_data())
         else:
-            # log.info('unknown packet: %04x %s' %
-            #          (cmd, byte_to_hexstring(data)))
+            log.info('unknown packet: %04x %s' % (cmd, byte_to_hexstring(data)))
             return False
 
         return True
@@ -585,6 +712,14 @@ class Tello(object):
             # Inform subscribers that we have a file and clean up.
             self.__publish(event=self.EVENT_FILE_RECEIVED, data=file.data())
             del self.file_recv[filenum]
+
+    def record_log_data(self, path = None):
+        if path == None:
+            path = '%s/Documents/tello-%s.dat' % (
+                os.getenv('HOME'),
+                datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S'))
+        log.info('record log data in %s' % path)
+        self.log_data_file = open(path, 'wb')
 
     def __state_machine(self, event, sender, data, **args):
         self.lock.acquire()
@@ -668,7 +803,7 @@ class Tello(object):
         # port = 6038
         port = 11111
         sock.bind(('', port))
-        sock.settimeout(5.0)
+        sock.settimeout(1.0)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
         log.info('video receive buffer size = %d' %
                  sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
@@ -713,7 +848,11 @@ class Tello(object):
                 if show_history:
                     prev_ts = history[0][0]
                     for i in range(1, len(history)):
-                        [ts, sz, sn] = history[i]
+                        [ ts, sz, sn ] = history[i]
+                        print('    %02d:%02d:%02d.%03d %4d bytes %04x +%03d%s' %
+                              (ts.hour, ts.minute, ts.second, ts.microsecond/1000,
+                               sz, sn, (ts - prev_ts).total_seconds()*1000,
+                               (' *' if i == len(history) - 1 else '')))
                         prev_ts = ts
                     history = history[-1:]
 
@@ -739,6 +878,7 @@ class Tello(object):
 
             except socket.timeout as ex:
                 log.error('video recv: timeout')
+                self.start_video()
                 data = None
             except Exception as ex:
                 log.error('video recv: %s' % str(ex))
